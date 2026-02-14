@@ -205,6 +205,12 @@
         </div>
     </nav>
 
+    <!-- Prod: Supabase baglanti hatasinda fallback yok, banner gosterilir -->
+    <div id="offlineBanner" class="hidden border-b border-amber-800 bg-amber-950/90 px-4 py-2 flex items-center justify-center gap-3 text-amber-200 text-sm">
+        <span>Sunucu bağlantısı kurulamadı. Veriler güncel değil.</span>
+        <button type="button" onclick="window.location.reload()" class="px-3 py-1 rounded bg-amber-700 hover:bg-amber-600 text-white font-medium">Yenile</button>
+    </div>
+
     <!-- MAIN APP: anasayfa doğrudan gösterilir, JS ile güncellenir -->
     <main id="app" class="flex-1 flex flex-col overflow-hidden min-h-0 min-h-[50vh]">
         <div class="h-full flex items-center justify-center bg-gradient-to-b from-[#0a0a0b] via-[#1a0a1a] to-[#0a0a0b] bg-cover bg-center p-4 sm:p-6">
@@ -253,15 +259,166 @@
         // Asset Strategy B: tek dosya dağıtım için base64 logo (boş bırakılırsa ./assets/coremind-logo.webp kullanılır)
         const COREMIND_LOGO_URL = '';
 
-        // --- DATA STORE ---
+        // --- SUPABASE CONFIG (runtime) ---
+        // Key'ler artık dosyada hardcoded DEĞİL.
+        // Prod: /api/public-config endpoint'inden yüklenir (Vercel Env Variables).
+        // Local dev: .env.local dosyasından veya doğrudan fallback değerlerden okunur.
+        let SUPABASE_URL = '';
+        let SUPABASE_ANON_KEY = '';
+        let USE_SUPABASE = false;
+        const ALLOW_LOCAL_FALLBACK = (typeof location !== 'undefined' && (location.hostname === 'localhost' || location.hostname === '127.0.0.1'));
+
+        /**
+         * Runtime config yükleyici.
+         * 1) /api/public-config dener (Vercel prod/preview).
+         * 2) Başarısızsa ve localhost ise, .env.local'deki fallback kullanılır.
+         */
+        async function __loadRuntimeConfig() {
+            try {
+                const r = await fetch('/api/public-config', { cache: 'no-store' });
+                if (r.ok) {
+                    const cfg = await r.json();
+                    SUPABASE_URL = cfg.SUPABASE_URL || '';
+                    SUPABASE_ANON_KEY = cfg.SUPABASE_ANON_KEY || '';
+                }
+            } catch (_) {
+                // /api/ yoksa (local file:// veya static server) sessizce geç.
+                console.warn('[Config] /api/public-config ulaşılamadı, local fallback kontrol ediliyor.');
+            }
+            USE_SUPABASE = !!(SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.length > 50);
+        }
+
+        let supabase = null;
+        const __cache = {};
+        function getCache(key, def) { return __cache[key] !== undefined ? __cache[key] : (def !== undefined ? def : []); }
+        function setCache(key, val) { __cache[key] = val; }
+
+        // --- SUPABASE MODEL MAPPING (tek katman: DB row <-> UI model) ---
+        const SupabaseModelMap = {
+            mapListingRowToModel: (r) => ({ id: r.id, createdByUserId: r.owner_id, ownerRole: r.owner_role, listingType: r.listing_type, title: r.title || '', city: r.city || '', genres: r.genres || [], bpmTargetMin: r.bpm_target_min, bpmTargetMax: r.bpm_target_max, hours: r.hours, date: r.date, budget: r.budget, notes: r.notes || '', visibility: r.visibility || 'public', status: r.status || 'active', createdAt: r.created_at ? new Date(r.created_at).getTime() : Date.now(), ...(r.extra || {}) }),
+            mapListingModelToInsert: (o) => {
+                const { id, createdAt, createdByUserId, ownerRole, listingType, title, city, genres, bpmTargetMin, bpmTargetMax, hours, date, budget, notes, visibility, status, ...rest } = o;
+                return { owner_id: createdByUserId, owner_role: ownerRole || '', listing_type: listingType, title: title || '', city: city || '', genres: genres || [], bpm_target_min: bpmTargetMin, bpm_target_max: bpmTargetMax, hours: hours, date: date || null, budget: budget != null ? parseFloat(budget) : null, notes: notes || '', visibility: visibility || 'public', status: status || 'active', extra: rest && Object.keys(rest).length ? rest : {} };
+            },
+            mapMessageRowToModel: (m) => ({ id: m.id, threadId: m.thread_id, senderId: m.sender_id, text: m.text, createdAt: m.created_at ? new Date(m.created_at).getTime() : 0, readBy: [] }),
+            mapMessageModelToInsert: (m) => ({ thread_id: m.threadId, sender_id: m.senderId, text: m.text }),
+            mapApplicationRowToModel: (a) => ({ id: a.id, listingId: a.listing_id, userId: a.applicant_id, status: a.status, createdAt: a.created_at ? new Date(a.created_at).getTime() : 0 }),
+            mapApplicationModelToInsert: (a) => ({ listing_id: a.listingId, applicant_id: a.userId, status: a.status || 'pending' })
+        };
+
+        // --- SUPABASE ERROR SURFACING ---
+        function showSupabaseError(err, context) {
+            if (!err) return;
+            console.error('[Supabase]', context || 'Error', err);
+            const msg = (err && err.message) ? String(err.message) : '';
+            let userMsg = 'Bir hata oluştu.';
+            if (/invalid api key|JWT|anon|eyJ/i.test(msg)) userMsg = 'Anon key hatalı veya geçersiz. Project Settings > API > anon public (JWT) kontrol edin.';
+            else if (/Invalid URL|fetch|network/i.test(msg)) userMsg = 'Proje URL hatalı veya ağ hatası. SUPABASE_URL kontrol edin.';
+            else if (/row level security|RLS|policy|permission denied/i.test(msg)) userMsg = 'RLS engelledi: Bu işlem için yetkiniz yok.';
+            else if (msg.length < 120) userMsg = msg;
+            if (typeof showToast === 'function') showToast(userMsg);
+            else alert(userMsg);
+        }
+
+        // --- DATA STORE (Supabase varsa cache; prod offline ise fallback yok) ---
         const Store = {
-            get: (key) => JSON.parse(localStorage.getItem(key) || '[]'),
-            set: (key, val) => localStorage.setItem(key, JSON.stringify(val)),
-            getObj: (key) => JSON.parse(localStorage.getItem(key) || 'null'),
-            setObj: (key, val) => localStorage.setItem(key, JSON.stringify(val)),
-            getCurrentUser: () => JSON.parse(localStorage.getItem('currentUser')),
-            setCurrentUser: (user) => localStorage.setItem('currentUser', JSON.stringify(user)),
-            logout: () => localStorage.removeItem('currentUser')
+            get: (key) => (supabase ? getCache(key, []) : (app._supabaseOffline ? getCache(key, []) : JSON.parse(localStorage.getItem(key) || '[]'))),
+            set: (key, val) => {
+                if (app._supabaseOffline) return;
+                if (supabase) { setCache(key, val); }
+                else { localStorage.setItem(key, JSON.stringify(val)); }
+            },
+            getObj: (key) => (supabase ? (__cache[key + '_obj'] !== undefined ? __cache[key + '_obj'] : null) : (app._supabaseOffline ? null : JSON.parse(localStorage.getItem(key) || 'null'))),
+            setObj: (key, val) => {
+                if (app._supabaseOffline) return;
+                if (supabase) { __cache[key + '_obj'] = val; }
+                else { localStorage.setItem(key, JSON.stringify(val)); }
+            },
+            getCurrentUser: () => (supabase ? __cache.currentUser : JSON.parse(localStorage.getItem('currentUser'))),
+            setCurrentUser: (user) => {
+                if (supabase) { __cache.currentUser = user; }
+                else { localStorage.setItem('currentUser', JSON.stringify(user)); }
+            },
+            logout: () => {
+                if (supabase) { __cache.currentUser = null; }
+                else { localStorage.removeItem('currentUser'); }
+            }
+        };
+
+        // --- SUPABASE DATA SERVICE ---
+        const SupabaseDataService = {
+            rowToListing: (r) => SupabaseModelMap.mapListingRowToModel(r),
+            listingToRow: (o) => SupabaseModelMap.mapListingModelToInsert(o),
+            loadListings: async () => {
+                if (!supabase) return;
+                const { data, error } = await supabase.from('listings').select('*').order('created_at', { ascending: false });
+                if (error) { showSupabaseError(error, 'loadListings'); return; }
+                setCache('listings', (data || []).map(SupabaseModelMap.mapListingRowToModel));
+            },
+            loadProfilesAndUsers: async () => {
+                if (!supabase) return;
+                const [pRes, djRes, vRes, oRes, dRes, cRes] = await Promise.all([
+                    supabase.from('profiles').select('*'),
+                    supabase.from('dj_profiles').select('*'),
+                    supabase.from('venue_profiles').select('*'),
+                    supabase.from('organizer_profiles').select('*'),
+                    supabase.from('decorator_profiles').select('*'),
+                    supabase.from('common_profiles').select('*')
+                ]);
+                const profiles = (pRes.data || []).map(r => ({ id: r.user_id, type: r.role, name: r.display_name, email: '', city: r.city || '', xp: r.xp || 0, level: r.level || 1, badges: r.badges || [] }));
+                setCache('users', profiles);
+                const djApp = (r) => ({ userId: r.user_id, genres: r.genres || [], bpmMin: r.bpm_min, bpmMax: r.bpm_max, nightlyFee: r.nightly_fee, bio: r.bio || '', logoDataUrl: r.logo_data_url, googleDriveLink: r.google_drive_link, techRider: r.tech_rider || '', equipmentProvided: r.equipment_provided || [], soundcloudEmbed: r.soundcloud_embed, spotifyEmbed: r.spotify_embed, mixcloudEmbed: r.mixcloud_embed, minNoticeDays: r.min_notice_days, travelRadiusKm: r.travel_radius_km, profilePhotoDataUrl: r.profile_photo_data_url, instagram: r.instagram, tiktok: r.tiktok, x: r.x, facebook: r.facebook, whatsapp: r.whatsapp, telegram: r.telegram, soundcloud: r.soundcloud, bandcamp: r.bandcamp });
+                const vApp = (r) => ({ userId: r.user_id, venueName: r.venue_name || '', city: r.city || '', capacity: r.capacity || '', typicalGenres: r.typical_genres || [], budgetRange: r.budget_range || '', equipment: r.equipment || [], ticketCutPercent: r.ticket_cut_percent, ticketCutAmount: r.ticket_cut_amount, ticketPricePolicy: r.ticket_price_policy || '', percentagePolicies: r.percentage_policies || '', profilePhotoDataUrl: r.profile_photo_data_url, instagram: r.instagram, tiktok: r.tiktok, x: r.x, facebook: r.facebook, whatsapp: r.whatsapp, telegram: r.telegram, soundcloud: r.soundcloud, bandcamp: r.bandcamp });
+                const oApp = (r) => ({ userId: r.user_id, organizerName: r.organizer_name || '', city: r.city || '', networkTags: r.network_tags || [], organizationFee: r.organization_fee, organizationFeePercent: r.organization_fee_percent, requirements: r.requirements || [], contactPhone: r.contact_phone || '', profilePhotoDataUrl: r.profile_photo_data_url, instagram: r.instagram, tiktok: r.tiktok, x: r.x, facebook: r.facebook, whatsapp: r.whatsapp, telegram: r.telegram, soundcloud: r.soundcloud, bandcamp: r.bandcamp });
+                const dApp = (r) => ({ userId: r.user_id, businessName: r.business_name || '', city: r.city || '', serviceAreaKm: r.service_area_km, categories: r.categories || [], portfolioDriveLinks: r.portfolio_drive_links || [], profilePhotoDataUrl: r.profile_photo_data_url, instagram: r.instagram, tiktok: r.tiktok, x: r.x, facebook: r.facebook, whatsapp: r.whatsapp, telegram: r.telegram, soundcloud: r.soundcloud, bandcamp: r.bandcamp });
+                setCache('djProfiles', (djRes.data || []).map(djApp));
+                setCache('venueProfiles', (vRes.data || []).map(vApp));
+                setCache('organizerProfiles', (oRes.data || []).map(oApp));
+                setCache('decoratorProfiles', (dRes.data || []).map(dApp));
+                setCache('commonProfiles', (cRes.data || []).map(r => ({ userId: r.user_id, displayName: r.display_name || '', avatarDataUrl: r.avatar_data_url, coverDataUrl: r.cover_data_url, bio: r.bio || '', languages: r.languages || [], tags: r.tags || [], workingCities: r.working_cities || [], showEmail: r.show_email, showPhone: r.show_phone, allowDirectBooking: r.allow_direct_booking !== false, preferredContactMethod: r.preferred_contact_method || 'in_app', lastUpdated: r.last_updated || 0 })));
+            },
+            loadMessages: async () => {
+                if (!supabase || !app.currentUser) return;
+                const uid = app.currentUser.id;
+                const { data: tpData } = await supabase.from('thread_participants').select('thread_id, unread_count').eq('user_id', uid);
+                const threadIds = [...new Set((tpData || []).map(t => t.thread_id))];
+                if (!threadIds.length) { setCache('messageThreads', []); setCache('messages', []); return; }
+                const { data: allPart } = await supabase.from('thread_participants').select('thread_id, user_id').in('thread_id', threadIds);
+                const partByThread = {};
+                (allPart || []).forEach(p => { if (!partByThread[p.thread_id]) partByThread[p.thread_id] = []; partByThread[p.thread_id].push(p.user_id); });
+                const { data: tData } = await supabase.from('message_threads').select('*').in('id', threadIds).order('last_message_at', { ascending: false, nullsFirst: true });
+                const threads = (tData || []).map(t => {
+                    const parts = partByThread[t.id] || [];
+                    const unreadBy = {};
+                    const myTp = (tpData || []).find(x => x.thread_id === t.id);
+                    if (myTp && myTp.unread_count) unreadBy[uid] = myTp.unread_count;
+                    return { id: t.id, participantIds: parts, createdAt: t.created_at ? new Date(t.created_at).getTime() : 0, lastMessageAt: t.last_message_at ? new Date(t.last_message_at).getTime() : 0, lastMessageText: t.last_message_text || '', context: t.context || {}, unreadBy };
+                });
+                setCache('messageThreads', threads);
+                const { data: mData, error: mErr } = await supabase.from('messages').select('*').in('thread_id', threadIds).order('created_at', { ascending: true });
+                if (mErr) { showSupabaseError(mErr, 'loadMessages'); return; }
+                setCache('messages', (mData || []).map(SupabaseModelMap.mapMessageRowToModel));
+            },
+            loadAll: async () => {
+                if (!supabase) return;
+                await SupabaseDataService.loadProfilesAndUsers();
+                await SupabaseDataService.loadListings();
+                const { data: appData, error: appErr } = await supabase.from('applications').select('*');
+                if (appErr) showSupabaseError(appErr, 'loadAll applications');
+                setCache('applications', (appData || []).map(SupabaseModelMap.mapApplicationRowToModel));
+                const { data: drData } = await supabase.from('deal_rooms').select('*');
+                setCache('dealRooms', (drData || []).map(r => ({ id: r.id, listingId: r.listing_id, applicantUserId: r.applicant_id, listingOwnerUserId: r.owner_id, status: r.status, offerTerms: r.offer_terms || {}, acceptedTermsSnapshot: r.accepted_terms_snapshot, createdAt: r.created_at ? new Date(r.created_at).getTime() : 0, updatedAt: r.updated_at ? new Date(r.updated_at).getTime() : 0 })));
+                const { data: drmData } = await supabase.from('deal_room_messages').select('*');
+                setCache('dealRoomMessages', (drmData || []).map(m => ({ id: m.id, dealRoomId: m.deal_room_id, userId: m.user_id, text: m.text, createdAt: m.created_at ? new Date(m.created_at).getTime() : 0 })));
+                const { data: ledData } = await supabase.from('ledger').select('*');
+                setCache('ledger', (ledData || []).map(e => ({ id: e.id, dealRoomId: e.deal_room_id, amount: e.amount, payerUserId: e.payer_user_id, payeeUserId: e.payee_user_id, status: e.status, createdAt: e.created_at ? new Date(e.created_at).getTime() : 0 })));
+                setCache('connections', []);
+                setCache('setUploads', []);
+                setCache('reviews', []);
+                setCache('reports', []);
+                setCache('messagingBlocklist', []);
+                if (app.currentUser) await SupabaseDataService.loadMessages();
+            }
         };
 
         const SCHEMA_VERSION = 11;
@@ -399,7 +556,7 @@
             Store.setObj('schemaVersion', SCHEMA_VERSION);
         }
 
-        if (!Store.get('users').length) {
+        if (!USE_SUPABASE && !Store.get('users').length) {
             Store.set('users', [
                 { id: 1, type: 'dj', name: 'DJ Pulse', email: 'dj@test.com', password: '123', location: 'İstanbul', createdAt: Date.now(), status: 'active', xp: 0, level: 1, badges: [] },
                 { id: 2, type: 'venue', name: 'The Hive Club', email: 'venue@test.com', password: '123', location: 'İzmir', createdAt: Date.now(), status: 'active', xp: 0, level: 1, badges: [] },
@@ -435,15 +592,17 @@
                 { id: 5, createdByUserId: 4, listingType: 'decorRental', title: 'BackDrop ve Totem Kiralama', city: 'İstanbul', pricingModel: 'perNight', price: 2500, currency: 'TRY', imagesDriveUrls: [], notes: 'BackDrop + totem seti', visibility: 'public', status: 'active', createdAt: Date.now() }
             ]);
         }
-        if (!Array.isArray(Store.get('connections'))) Store.set('connections', []);
-        if (!Array.isArray(Store.get('setUploads'))) Store.set('setUploads', []);
-        if (!Array.isArray(Store.get('reviews'))) Store.set('reviews', []);
-        if (!Array.isArray(Store.get('reports'))) Store.set('reports', []);
-        if (!Array.isArray(Store.get('applications'))) Store.set('applications', []);
-        if (!Array.isArray(Store.get('dealRooms'))) Store.set('dealRooms', []);
-        if (!Array.isArray(Store.get('dealRoomMessages'))) Store.set('dealRoomMessages', []);
-        if (!Array.isArray(Store.get('ledger'))) Store.set('ledger', []);
-        migrateStore();
+        if (!USE_SUPABASE) {
+            if (!Array.isArray(Store.get('connections'))) Store.set('connections', []);
+            if (!Array.isArray(Store.get('setUploads'))) Store.set('setUploads', []);
+            if (!Array.isArray(Store.get('reviews'))) Store.set('reviews', []);
+            if (!Array.isArray(Store.get('reports'))) Store.set('reports', []);
+            if (!Array.isArray(Store.get('applications'))) Store.set('applications', []);
+            if (!Array.isArray(Store.get('dealRooms'))) Store.set('dealRooms', []);
+            if (!Array.isArray(Store.get('dealRoomMessages'))) Store.set('dealRoomMessages', []);
+            if (!Array.isArray(Store.get('ledger'))) Store.set('ledger', []);
+            migrateStore();
+        }
 
         function nextId(key) {
             const list = Store.get(key);
@@ -690,7 +849,7 @@
                 }
             }
             var roleLabelCard = listing.ownerRole === 'dj' ? 'DJ' : listing.ownerRole === 'venue' ? 'Mekan' : listing.ownerRole === 'decorator' ? 'Dekorcu' : 'Organizatör';
-            rightColumnHtml += '<button type="button" onclick="app.router(\'profile-view\', { userId: ' + listing.createdByUserId + ' })" class="px-3 py-2 rounded border border-gray-600 text-gray-400 text-sm hover:bg-gray-800 transition flex-shrink-0 self-center">Profil</button><button type="button" onclick="Messaging.openThreadWith(' + listing.createdByUserId + ', { listingId: ' + listing.id + ' }); app.router(\'messages\', { threadId: Messaging._lastThreadId });" class="px-3 py-2 rounded border border-brand-accent text-brand-accent text-sm hover:bg-brand-accent/10 transition flex-shrink-0 self-center">Mesaj</button><button type="button" onclick="ApplicationsAPI.apply(' + listing.id + ')" class="px-4 py-2 rounded bg-brand-accent hover:bg-violet-600 text-white text-sm font-bold transition flex-shrink-0 self-center">Başvur</button>';
+            rightColumnHtml += '<button type="button" onclick="app.router(\'profile-view\', { userId: ' + JSON.stringify(listing.createdByUserId) + ' })" class="px-3 py-2 rounded border border-gray-600 text-gray-400 text-sm hover:bg-gray-800 transition flex-shrink-0 self-center">Profil</button><button type="button" onclick="(async function(){ await Messaging.openThreadWith(' + JSON.stringify(listing.createdByUserId) + ', { listingId: ' + listing.id + ' }); app.router(\'messages\', { threadId: Messaging._lastThreadId }); })()" class="px-3 py-2 rounded border border-brand-accent text-brand-accent text-sm hover:bg-brand-accent/10 transition flex-shrink-0 self-center">Mesaj</button><button type="button" onclick="ApplicationsAPI.apply(' + listing.id + ')" class="px-4 py-2 rounded bg-brand-accent hover:bg-violet-600 text-white text-sm font-bold transition flex-shrink-0 self-center">Başvur</button>';
             return `
             <article class="listing-card rounded-xl border border-gray-800 bg-gray-900/50 hover:border-gray-600 hover:bg-gray-900/80 transition-all duration-200 flex overflow-hidden items-stretch" aria-label="${listing.title}">
                 <div class="listing-strip ${ui.stripClass}" aria-hidden="true"></div>
@@ -764,19 +923,20 @@
         const GENRES = ['Techno', 'House', 'Trance', 'Drum & Bass', 'Dubstep', 'Electro', 'Minimal', 'Progressive', 'Hardstyle', 'Diğer'];
         function getProfile(user) {
             if (!user) return null;
-            if (user.type === 'dj') return Store.get('djProfiles').find(p => p.userId === user.id);
-            if (user.type === 'venue') return Store.get('venueProfiles').find(p => p.userId === user.id);
-            if (user.type === 'organizer') return Store.get('organizerProfiles').find(p => p.userId === user.id);
-            if (user.type === 'decorator') return Store.get('decoratorProfiles').find(p => p.userId === user.id);
+            const uid = String(user.id);
+            if (user.type === 'dj') return Store.get('djProfiles').find(p => String(p.userId) === uid);
+            if (user.type === 'venue') return Store.get('venueProfiles').find(p => String(p.userId) === uid);
+            if (user.type === 'organizer') return Store.get('organizerProfiles').find(p => String(p.userId) === uid);
+            if (user.type === 'decorator') return Store.get('decoratorProfiles').find(p => String(p.userId) === uid);
             return null;
         }
         function getCommonProfile(userId) {
-            return (Store.get('commonProfiles') || []).find(p => p.userId === userId) || null;
+            return (Store.get('commonProfiles') || []).find(p => String(p.userId) === String(userId)) || null;
         }
         /* Profile System v1: commonProfiles + getFullProfile (ProfileResolver), ProfileViewPage / ProfileEditPage, UploadEngine avatar/cover, privacy toggles, listing card "Profil" + deal room mini profile. QA: profile view/edit, avatar upload, completeness %, role sections, export commonProfiles. */
         /** ProfileResolver: unified profile for view/edit. Fallback empty values show as "—". */
         function getFullProfile(userId) {
-            var user = (Store.get('users') || []).find(function(u) { return u.id === userId; });
+            var user = (Store.get('users') || []).find(function(u) { return String(u.id) === String(userId); });
             if (!user) return { user: null, common: null, dj: null, organizer: null, venue: null, decorator: null, completenessScore: 0, lastUpdated: 0 };
             var common = getCommonProfile(userId) || { displayName: '', avatarDataUrl: null, coverDataUrl: null, bio: '', languages: [], tags: [], workingCities: [], showEmail: false, showPhone: false, allowDirectBooking: true, preferredContactMethod: 'in_app', lastUpdated: 0 };
             var roleProfile = getProfile(user);
@@ -948,6 +1108,7 @@
         // --- APP CONTROLLER ---
         const app = {
             currentUser: null,
+            _supabaseOffline: false,
             init: () => {
                 try {
                     app.currentUser = Store.getCurrentUser ? Store.getCurrentUser() : null;
@@ -969,13 +1130,14 @@
                 const nav = document.getElementById('navLinks');
                 if (app.currentUser) {
                     const u = app.currentUser;
+                    const off = app._supabaseOffline;
                     const roleLabel = u.type === 'dj' ? 'DJ' : u.type === 'venue' ? 'Mekan' : u.type === 'decorator' ? 'Dekorcu' : 'Organizatör';
                     nav.innerHTML = `
                         <span class="nav-role-badge text-gray-400 hidden sm:inline text-xs sm:text-sm">${roleLabel} <span class="text-gray-300">${u.name}</span></span>
                         <button type="button" onclick="app.router('dashboard')" class="nav-btn nav-btn-panel">Panel</button>
                         <button type="button" onclick="app.router('listings')" class="nav-btn nav-btn-listings">İlanlar</button>
                         ${u.type === 'dj' ? '<button type="button" onclick="app.router(\'logo-studio\')" class="nav-btn nav-btn-logo">Logo</button><button type="button" onclick="app.router(\'set-upload\')" class="nav-btn nav-btn-set">Set</button>' : ''}
-                        <button type="button" onclick="app.router('listing-create')" class="nav-btn nav-btn-create">İlan Aç</button>
+                        <button type="button" onclick="if(app._supabaseOffline){ showToast('Sunucu bağlantısı yok.'); return; } app.router('listing-create')" class="nav-btn nav-btn-create ${off ? 'opacity-50 cursor-not-allowed' : ''}" ${off ? 'disabled title="Sunucu bağlantısı yok"' : ''}>İlan Aç</button>
                         <button type="button" onclick="app.router('match')" class="nav-btn nav-btn-match">Eşleşme</button>
                         <button type="button" onclick="app.router('calendar')" class="nav-btn nav-btn-reviews">Takvim</button>
                         <button type="button" onclick="app.router('messages')" class="nav-btn nav-btn-connections relative inline-flex items-center gap-1">Mesajlar${(function(){ var n = (typeof Messaging !== 'undefined' && Messaging.getUnreadTotal) ? (Messaging.getUnreadTotal(u.id) || 0) : 0; return n > 0 ? '<span class="rounded-full bg-red-500 text-white text-xs min-w-[18px] h-[18px] flex items-center justify-center">' + n + '</span>' : ''; })()}</button>
@@ -989,7 +1151,10 @@
                     nav.innerHTML = `<button type="button" onclick="app.router('register')" class="nav-btn nav-btn-listings">Üye ol</button><button type="button" onclick="app.router('login')" class="nav-btn nav-btn-panel">Giriş yap</button>`;
                 }
             },
-            logout: () => { Store.logout(); window.location.reload(); },
+            logout: async () => {
+                if (USE_SUPABASE && supabase) { await supabase.auth.signOut(); Store.logout(); app.currentUser = null; app.updateNav(); app.router('home'); return; }
+                Store.logout(); window.location.reload();
+            },
             _mapInstance: null,
             _routeParams: {},
             toggleMapMode: () => {
@@ -1621,7 +1786,7 @@
                 const u = app.currentUser;
                 const p = getProfile(u);
                 const listings = Store.get('listings');
-                const myListings = listings.filter(l => l.createdByUserId === u.id);
+                const myListings = listings.filter(l => String(l.createdByUserId) === String(u.id));
                 const roleLabel = u.type === 'dj' ? 'DJ' : u.type === 'venue' ? 'Mekan sahibi' : u.type === 'decorator' ? 'Dekorcu' : 'Organizatör';
                 const roleDesc = u.type === 'dj' ? 'Logo tasarla, set yükle, ilanlara başvur.' : u.type === 'venue' ? 'İhtiyaç ilanı aç, DJ bul, eşleş.' : u.type === 'decorator' ? 'Dekor kiralama ilanı aç, Drive görselleri ekle.' : 'Etkinlik ilanı aç, tanıdık bildir, eşleş.';
                 const drivePortfolioLink = (u.type === 'dj' && p && p.googleDriveLink) ? `<p class="text-sm mb-4"><a href="${String(p.googleDriveLink).replace(/"/g, '&quot;')}" target="_blank" rel="noopener noreferrer" class="text-brand-glow hover:underline inline-flex items-center gap-1"><i class="fa-brands fa-google-drive"></i> Google Drive portföyüm</a></p>` : '';
@@ -1659,7 +1824,7 @@
                                 <div><div class="font-bold">Set Yükle</div><div class="text-sm text-gray-500">Portföy ekle</div></div>
                             </button>
                             ` : ''}
-                            <button onclick="app.router('listing-create')" class="dashboard-card hover:border-brand-accent">
+                            <button onclick="if(app._supabaseOffline){ showToast('Sunucu bağlantısı yok.'); return; } app.router('listing-create')" class="dashboard-card hover:border-brand-accent ${app._supabaseOffline ? 'opacity-50 cursor-not-allowed' : ''}" ${app._supabaseOffline ? 'disabled title="Sunucu bağlantısı yok"' : ''}>
                                 <i class="fa-solid fa-plus text-2xl text-brand-glow mb-2"></i>
                                 <div><div class="font-bold">İlan Aç</div><div class="text-sm text-gray-500">${myListings.length} ilanın var</div></div>
                             </button>
@@ -1669,7 +1834,7 @@
                             </button>
                             <button onclick="app.router('deal-rooms')" class="dashboard-card hover:border-amber-500/50">
                                 <i class="fa-solid fa-comments text-2xl text-amber-400 mb-2"></i>
-                                <div><div class="font-bold">Teklif odalarım</div><div class="text-sm text-gray-500">${(Store.get('dealRooms') || []).filter(r => r.applicantUserId === u.id || r.listingOwnerUserId === u.id).length} oda</div></div>
+                                <div><div class="font-bold">Teklif odalarım</div><div class="text-sm text-gray-500">${(Store.get('dealRooms') || []).filter(r => String(r.applicantUserId) === String(u.id) || String(r.listingOwnerUserId) === String(u.id)).length} oda</div></div>
                             </button>
                             <button onclick="app.router('profile-edit')" class="dashboard-card hover:border-brand-glow/50">
                                 <i class="fa-solid fa-user-circle text-2xl text-brand-glow mb-2"></i>
@@ -1684,7 +1849,7 @@
                                 <div><div class="font-bold">Sözleşme taslağı</div><div class="text-sm text-gray-500">DOCX indir</div></div>
                             </button>
                         </section>
-                        <div class="text-center text-sm text-gray-500 pt-2 pb-4">${listings.length} ilan · ${(Store.get('dealRooms') || []).filter(r => r.applicantUserId === u.id || r.listingOwnerUserId === u.id).length} teklif odası</div>
+                        <div class="text-center text-sm text-gray-500 pt-2 pb-4">${listings.length} ilan · ${(Store.get('dealRooms') || []).filter(r => String(r.applicantUserId) === String(u.id) || String(r.listingOwnerUserId) === String(u.id)).length} teklif odası</div>
                     </div>
                 </div>`;
             },
@@ -1954,7 +2119,7 @@
             connections: () => {
                 const u = app.currentUser;
                 const conns = Store.get('connections');
-                const received = conns.filter(c => c.toUserId === u.id);
+                const received = conns.filter(c => String(c.toUserId) === String(u.id));
                 const users = Store.get('users');
                 const getName = (id) => (users.find(x => x.id === id) || {}).name || '?';
                 return `
@@ -1962,7 +2127,7 @@
                     <div class="max-w-2xl mx-auto">
                         <h2 class="text-xl sm:text-2xl font-display font-bold mb-6">Bağlantılar (Tanıdık Bildirimi)</h2>
                         <h3 class="font-bold mb-2">Bana gelen</h3>
-                        <ul class="space-y-2 mb-8">${received.length ? received.map(c => `<li class="p-3 rounded border border-gray-800 flex items-center justify-between gap-2 flex-wrap"><span>${getName(c.fromUserId)} → "${c.message || ''}" (${c.type})</span><button type="button" onclick="Messaging.openThreadWith('${String(c.fromUserId).replace(/'/g, "\\'")}'); app.router('messages', { threadId: Messaging._lastThreadId }); app.updateNav();" class="text-sm text-brand-accent hover:underline">Mesaj</button></li>`).join('') : '<li class="text-gray-500">Henüz bildirim yok.</li>'}</ul>
+                        <ul class="space-y-2 mb-8">${received.length ? received.map(c => `<li class="p-3 rounded border border-gray-800 flex items-center justify-between gap-2 flex-wrap"><span>${getName(c.fromUserId)} → "${c.message || ''}" (${c.type})</span><button type="button" onclick="(async function(){ await Messaging.openThreadWith('${String(c.fromUserId).replace(/'/g, "\\'")}'); app.router('messages', { threadId: Messaging._lastThreadId }); app.updateNav(); })()" class="text-sm text-brand-accent hover:underline">Mesaj</button></li>`).join('') : '<li class="text-gray-500">Henüz bildirim yok.</li>'}</ul>
                         <h3 class="font-bold mb-2">Tanıdık bildirimi gönder</h3>
                         <p class="text-sm text-gray-400 mb-4">Organizatörler "Bu DJ'yi tanıyorum" veya "Bu mekanı tanıyorum" diyerek bağlantı gönderebilir. MVP: Basit liste.</p>
                         <form id="connectionForm" onsubmit="return false;" class="space-y-4">
@@ -1990,7 +2155,7 @@
                 const terms = getEffectiveTerms(room, listing, owner, applicant);
                 const ot = room.offerTerms || {};
                 const statusLabels = { initiated: 'Başlatıldı', negotiating: 'Pazarlık', accepted: 'Kabul', escrow_pending: 'Ödeme bekleniyor', confirmed: 'Onaylı', completed: 'Tamamlandı', dispute: 'İhtilaf' };
-                const canEdit = app.currentUser && (app.currentUser.id === applicantUserId || app.currentUser.id === room.listingOwnerUserId);
+                const canEdit = app.currentUser && (String(app.currentUser.id) === String(applicantUserId) || String(app.currentUser.id) === String(room.listingOwnerUserId));
                 const econ = listing ? computeDealEconomics(listing, owner, applicant, terms) : null;
                 const dealSummaryHtml = econ ? '<div class="rounded border border-gray-700 p-3 bg-gray-900/50 text-sm"><div class="font-bold text-gray-300 mb-2">Deal özeti (sim)</div><ul class="space-y-1 text-gray-400"><li>Bütçe: ' + (econ.budget || 0) + ' TL</li><li>Mekan payı: ' + Math.round(econ.venueShare) + ' TL</li><li>Organizatör: ' + Math.round(econ.orgFee) + ' TL</li><li>DJ ücreti: ' + econ.djFee + ' TL</li>' + (econ.decorCost > 0 ? '<li>Dekor: ' + econ.decorCost + ' TL</li>' : '') + '<li class="text-brand-glow font-bold">Net (kalan): ' + Math.round(econ.net) + ' TL</li></ul></div>' : '';
                 return `
@@ -2013,7 +2178,7 @@
                         </div>
                         <div id="tabChat" class="space-y-3">
                             <div class="rounded border border-gray-800 p-3 max-h-64 overflow-y-auto space-y-2">${messages.length ? messages.map(m => { const u = users.find(x => x.id === m.userId); return '<div class="text-sm"><span class="text-gray-500">' + (u ? escapeHtml(u.name) : '') + '</span>: ' + escapeHtml(m.text) + '</div>'; }).join('') : '<p class="text-gray-500 text-sm">Henüz mesaj yok.</p>'}</div>
-                            ${canEdit ? '<form onsubmit="var t=document.getElementById(\'dealMsgText\'); if(t && t.value.trim()){ DealRoomAPI.sendMessage(' + room.id + ', t.value.trim()); t.value=\'\'; app.router(\'deal-room\', app._routeParams); } return false;"><input type="text" id="dealMsgText" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white" placeholder="Mesaj yazın"><button type="submit" class="mt-2 px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Gönder</button></form>' : ''}
+                            ${canEdit ? '<form onsubmit="if(app._supabaseOffline){ showToast(\'Sunucu bağlantısı yok.\'); return false; } (async function(){ var t=document.getElementById(\'dealMsgText\'); if(t && t.value.trim()){ await DealRoomAPI.sendMessage(' + room.id + ', t.value.trim()); t.value=\'\'; app.router(\'deal-room\', app._routeParams); } })(); return false;"><input type="text" id="dealMsgText" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white" placeholder="Mesaj yazın" ' + (app._supabaseOffline ? 'disabled' : '') + '><button type="submit" class="mt-2 px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold ' + (app._supabaseOffline ? 'opacity-50 cursor-not-allowed' : '') + '" ' + (app._supabaseOffline ? 'disabled title="Sunucu bağlantısı yok"' : '') + '>Gönder</button></form>' : ''}
                         </div>
                         <div id="tabOffer" class="hidden space-y-3">
                             ${dealSummaryHtml}
@@ -2025,7 +2190,7 @@
                                     var reqText = Array.isArray(t.requirements) ? t.requirements.join('\n') : '';
                                     var delText = Array.isArray(t.deliverables) ? t.deliverables.join('\n') : '';
                                     var demoText = Array.isArray(t.demoLinks) ? t.demoLinks.join('\n') : '';
-                                    return '<form onsubmit="DealRoomAPI.updateOffer(' + room.id + ', collectOfferTermsFromForm()); app.router(\'deal-room\', app._routeParams); return false;" class="space-y-4">' +
+                                    return '<form onsubmit="(async function(){ await DealRoomAPI.updateOffer(' + room.id + ', collectOfferTermsFromForm()); app.router(\'deal-room\', app._routeParams); })(); return false;" class="space-y-4">' +
                                     '<div class="grid grid-cols-1 sm:grid-cols-3 gap-2"><input type="number" id="offerPrice" placeholder="Ücret (TL)" value="' + (t.price != null ? t.price : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="date" id="offerDate" value="' + (t.date || '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerHours" placeholder="Saat" value="' + (t.hours != null ? t.hours : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"></div>' +
                                     '<div class="grid grid-cols-1 sm:grid-cols-3 gap-2"><input type="text" id="offerEventTitle" placeholder="Etkinlik adı" value="' + escapeHtml(t.eventTitle || '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white sm:col-span-2"><input type="text" id="offerEventCity" placeholder="Şehir" value="' + escapeHtml(t.eventCity || '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"></div>' +
                                     '<input type="number" id="offerEventBudget" placeholder="Bütçe (TL)" value="' + (t.eventBudget != null ? t.eventBudget : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white">' +
@@ -2033,7 +2198,7 @@
                                     '<div class="border-t border-gray-700 pt-2"><span class="text-xs text-gray-500">Organizatör</span><div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-1"><select id="offerOrgModel" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><option value="flat"' + (t.organizerFeeModel === 'flat' ? ' selected' : '') + '>Sabit TL</option><option value="percent"' + (t.organizerFeeModel === 'percent' ? ' selected' : '') + '>Yüzde</option><option value="hybrid"' + (t.organizerFeeModel === 'hybrid' ? ' selected' : '') + '>Hibrit</option></select><input type="number" id="offerOrgFee" placeholder="TL" value="' + (t.organizerFee != null ? t.organizerFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerOrgPct" placeholder="%" value="' + (t.organizerFeePercent != null ? t.organizerFeePercent : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"></div><textarea id="offerRequirements" placeholder="Gereksinimler (satır satır)" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1 h-16">' + escapeHtml(reqText) + '</textarea><textarea id="offerDeliverables" placeholder="Teslim edilecekler" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1 h-12">' + escapeHtml(delText) + '</textarea></div>' +
                                     '<div class="border-t border-gray-700 pt-2"><span class="text-xs text-gray-500">DJ</span><div class="grid grid-cols-2 sm:grid-cols-5 gap-2 mt-1"><input type="number" id="offerRateBase" placeholder="Baz TL" value="' + (r.baseFee != null ? r.baseFee : t.price != null ? t.price : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerRateExtraHour" placeholder="Ek saat TL" value="' + (r.extraHourFee != null ? r.extraHourFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerRateTravel" placeholder="Yol TL" value="' + (r.travelFee != null ? r.travelFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerRateAfterParty" placeholder="After party TL" value="' + (r.afterPartyFee != null ? r.afterPartyFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerDeposit" placeholder="Depozito" value="' + (r.depositAmount != null ? r.depositAmount : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"></div><textarea id="offerTechRider" placeholder="Tech rider (override)" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1 h-12">' + escapeHtml(t.techRiderOverride || '') + '</textarea><input type="number" id="offerSoundcheck" placeholder="Soundcheck (dk)" value="' + (t.soundcheckMinutes != null ? t.soundcheckMinutes : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1"><textarea id="offerDemoLinks" placeholder="Demo/set linkleri (satır satır)" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1 h-12">' + escapeHtml(demoText) + '</textarea><input type="text" id="offerCancelPolicy" placeholder="İptal politikası" value="' + escapeHtml(t.cancelPolicy || '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white mt-1"></div>' +
                                     '<div class="border-t border-gray-700 pt-2"><span class="text-xs text-gray-500">Dekor</span><div class="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-1"><input type="number" id="offerDecorPrice" placeholder="Kira TL" value="' + (t.decorPrice != null ? t.decorPrice : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerDecorSetup" placeholder="Kurulum TL" value="' + (t.decorSetupFee != null ? t.decorSetupFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerDecorDeposit" placeholder="Depozito" value="' + (t.decorDeposit != null ? t.decorDeposit : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"><input type="number" id="offerDecorDeliveryFee" placeholder="Teslimat TL" value="' + (t.decorDeliveryFee != null ? t.decorDeliveryFee : '') + '" class="w-full bg-black/50 border border-gray-700 rounded p-2 text-white"></div><label class="flex items-center gap-2 text-sm text-gray-400 mt-1"><input type="checkbox" id="offerDecorDeliveryIncluded"' + (t.decorDeliveryIncluded ? ' checked' : '') + '> Teslimat dahil</label></div>' +
-                                    '<div class="flex flex-wrap gap-2"><button type="submit" class="px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Teklifi kaydet</button>' + (room.status !== 'accepted' ? '<button type="button" onclick="DealRoomAPI.updateStatus(' + room.id + ', \'accepted\'); app.router(\'deal-room\', app._routeParams);" class="px-4 py-2 rounded bg-amber-600 text-white text-sm font-bold">Kabul et (snapshot alınır)</button>' : '') + '</div></form>';
+                                    '<div class="flex flex-wrap gap-2"><button type="submit" class="px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Teklifi kaydet</button>' + (room.status !== 'accepted' ? '<button type="button" onclick="(async function(){ await DealRoomAPI.updateStatus(' + room.id + ', \'accepted\'); app.router(\'deal-room\', app._routeParams); })()" class="px-4 py-2 rounded bg-amber-600 text-white text-sm font-bold">Kabul et (snapshot alınır)</button>' : '') + '</div></form>';
                                 })() : '<p class="text-sm text-gray-400">Ücret: ' + (terms.price != null ? terms.price + ' TL' : '-') + ', Tarih: ' + (terms.date || '-') + ', Saat: ' + (terms.hours != null ? terms.hours : '-') + '</p>'}
                             </div>
                         </div>
@@ -2046,7 +2211,7 @@
                             <div class="rounded border border-gray-800 p-3">
                                 <div class="text-xs font-bold text-gray-400 uppercase mb-2">Ledger (sim)</div>
                                 ${ledgerEntries.length ? '<ul class="space-y-1 text-sm text-gray-400">' + ledgerEntries.map(e => '<li>' + e.amount + ' TL · ' + e.status + ' · ' + (e.payerUserId === app.currentUser.id ? 'Ödedim' : 'Alacak') + '</li>').join('') + '</ul>' : '<p class="text-gray-500 text-sm">Henüz ödeme kaydı yok.</p>'}
-                                ${canEdit ? '<button type="button" onclick="var amt=prompt(\'Tutar (TL)\'); if(amt){ LedgerAPI.add(' + room.id + ', parseFloat(amt), app.currentUser.id, ' + (room.listingOwnerUserId === app.currentUser.id ? applicantUserId : room.listingOwnerUserId) + ', \'held\'); DealRoomAPI.updateStatus(' + room.id + ', \'escrow_pending\'); app.router(\'deal-room\', app._routeParams); }" class="mt-2 px-4 py-2 rounded bg-amber-600 text-white text-sm font-bold">Ödeme yap (sim)</button>' : ''}
+                                ${canEdit ? '<button type="button" onclick="(async function(){ var amt=prompt(\'Tutar (TL)\'); if(amt){ var payee=' + JSON.stringify(room.listingOwnerUserId === app.currentUser.id ? applicantUserId : room.listingOwnerUserId) + '; await LedgerAPI.add(' + room.id + ', parseFloat(amt), app.currentUser.id, payee, \'held\'); await DealRoomAPI.updateStatus(' + room.id + ', \'escrow_pending\'); app.router(\'deal-room\', app._routeParams); } })()" class="mt-2 px-4 py-2 rounded bg-amber-600 text-white text-sm font-bold">Ödeme yap (sim)</button>' : ''}
                             </div>
                         </div>
                     </div>
@@ -2055,7 +2220,7 @@
 
             dealRooms: () => {
                 const u = app.currentUser;
-                const rooms = (Store.get('dealRooms') || []).filter(r => r.applicantUserId === u.id || r.listingOwnerUserId === u.id);
+                const rooms = (Store.get('dealRooms') || []).filter(r => String(r.applicantUserId) === String(u.id) || String(r.listingOwnerUserId) === String(u.id));
                 const listings = Store.get('listings');
                 const users = Store.get('users');
                 const statusLabels = { initiated: 'Başlatıldı', negotiating: 'Pazarlık', accepted: 'Kabul', escrow_pending: 'Ödeme bekleniyor', confirmed: 'Onaylı', completed: 'Tamamlandı', dispute: 'İhtilaf' };
@@ -2079,7 +2244,7 @@
                 var full = getFullProfile(userId);
                 var user = full.user;
                 var common = full.common;
-                var isOwner = app.currentUser && app.currentUser.id === userId;
+                var isOwner = app.currentUser && String(app.currentUser.id) === String(userId);
                 if (!user) return '<div class="page-shell"><p class="text-gray-400">Kullanıcı bulunamadı.</p></div>';
                 var roleLabel = user.type === 'dj' ? 'DJ' : user.type === 'venue' ? 'Mekan' : user.type === 'organizer' ? 'Organizatör' : 'Dekorcu';
                 var displayImg = resolveDisplayImageForUser(user);
@@ -2091,7 +2256,7 @@
                 var coverHtml = (common && common.coverDataUrl) ? '<div class="h-40 sm:h-52 rounded-t-xl bg-cover bg-center" style="background-image:url(\'' + (common.coverDataUrl.replace(/'/g, "\\'")) + '\')"></div>' : '';
                 var actions = '';
                 if (!isOwner && app.currentUser) {
-                    actions = '<div class="flex flex-wrap gap-2 mt-3"><button type="button" onclick="Messaging.openThreadWith(' + userId + '); app.router(\'messages\', { threadId: Messaging._lastThreadId });" class="px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Mesaj Gönder</button><button type="button" onclick="if(navigator.share){navigator.share({title:\'' + escapeHtml(displayName) + '\',url:location.href}).catch(function(){});}else{ navigator.clipboard.writeText(location.href); alert(\'Link kopyalandı\');}" class="px-4 py-2 rounded border border-gray-600 text-gray-400 text-sm">Paylaş</button></div>';
+                    actions = '<div class="flex flex-wrap gap-2 mt-3"><button type="button" onclick="(async function(){ await Messaging.openThreadWith(' + JSON.stringify(userId) + '); app.router(\'messages\', { threadId: Messaging._lastThreadId }); })()" class="px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Mesaj Gönder</button><button type="button" onclick="if(navigator.share){navigator.share({title:\'' + escapeHtml(displayName) + '\',url:location.href}).catch(function(){});}else{ navigator.clipboard.writeText(location.href); alert(\'Link kopyalandı\');}" class="px-4 py-2 rounded border border-gray-600 text-gray-400 text-sm">Paylaş</button></div>';
                 }
                 if (isOwner) actions = '<div class="flex flex-wrap gap-2 mt-3"><button type="button" onclick="app.router(\'profile-edit\')" class="px-4 py-2 rounded bg-brand-accent text-white text-sm font-bold">Profili düzenle</button></div>';
                 var contactBlock = !isOwner ? '<p class="text-sm text-gray-500 mt-2">İletişim yalnızca uygulama içi mesajlaşma ile yapılır.</p>' : '';
@@ -2206,7 +2371,7 @@
                 var selectedId = selectedThreadId != null ? Number(selectedThreadId) : (threads.length ? threads[0].id : null);
                 if (selectedId) Messaging.markThreadRead(selectedId, u.id);
                 var threadListHtml = threads.map(function(t) {
-                    var otherId = t.participantIds[0] === u.id ? t.participantIds[1] : t.participantIds[0];
+                    var otherId = String(t.participantIds[0]) === String(u.id) ? t.participantIds[1] : t.participantIds[0];
                     var other = users.find(function(x) { return x.id === otherId; });
                     var full = other ? getFullProfile(other.id) : null;
                     var common = full && full.common;
@@ -2227,19 +2392,19 @@
                 var chatHtml = '';
                 if (selectedId) {
                     var selThread = threads.find(function(x) { return x.id === selectedId; });
-                    var otherId = selThread ? (selThread.participantIds[0] === u.id ? selThread.participantIds[1] : selThread.participantIds[0]) : null;
+                    var otherId = selThread ? (String(selThread.participantIds[0]) === String(u.id) ? selThread.participantIds[1] : selThread.participantIds[0]) : null;
                     var otherUser = otherId ? users.find(function(x) { return x.id === otherId; }) : null;
                     var otherName = otherUser ? (getFullProfile(otherId).common && getFullProfile(otherId).common.displayName) || otherUser.name : '—';
                     var msgs = Messaging.getMessages(selectedId);
                     var bubbles = msgs.map(function(m) {
-                        var isMe = m.senderId === u.id;
+                        var isMe = String(m.senderId) === String(u.id);
                         return '<div class="flex ' + (isMe ? 'justify-end' : 'justify-start') + '"><div class="max-w-[80%] rounded-xl px-4 py-2 ' + (isMe ? 'bg-brand-accent text-white' : 'bg-gray-700 text-gray-200') + '"><p class="text-sm whitespace-pre-wrap">' + escapeHtml(m.text) + '</p><p class="text-xs mt-1 opacity-75">' + new Date(m.createdAt).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' }) + '</p></div></div>';
                     }).join('');
                     chatHtml = '<div class="flex flex-col h-full"><div class="border-b border-gray-800 p-3 flex items-center justify-between gap-2 flex-wrap"><span class="font-medium text-gray-200">' + escapeHtml(otherName) + '</span><div class="flex gap-2"><button type="button" onclick="var r=prompt(\'Rapor nedeni (kısa)\'); if(r!=null){ Messaging.reportThread(' + selectedId + ', r); if(typeof showToast===\'function\') showToast(\'Rapor kaydedildi.\'); app.router(\'messages\', { threadId: ' + selectedId + ' }); }" class="text-xs text-gray-400 hover:text-white">Raporla</button><button type="button" onclick="if(confirm(\'Bu kullanıcıyı engellemek istediğinize emin misiniz? Engellenen size mesaj atamaz.\')){ Messaging.blockUser(' + JSON.stringify(u.id) + ', ' + JSON.stringify(otherId) + '); app.router(\'messages\'); app.updateNav(); }" class="text-xs text-gray-400 hover:text-red-400">Engelle</button></div></div>' +
                         '<div id="messagesChatArea" class="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">' + bubbles + '</div>' +
-                        '<div class="border-t border-gray-800 p-3"><form onsubmit="var ta=document.getElementById(\'messageComposer\'); var t=ta&&ta.value?ta.value.trim():\'\'; if(t){ Messaging.sendMessage(' + selectedId + ', app.currentUser.id, t); ta.value=\'\'; app.router(\'messages\', { threadId: ' + selectedId + ' }); app.updateNav(); } return false;" class="flex gap-2">' +
-                        '<textarea id="messageComposer" rows="2" class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-2 text-white placeholder-gray-500 resize-none" placeholder="Mesaj yazın (Enter gönder, Shift+Enter yeni satır)" onkeydown="if(event.key===\'Enter\'&&!event.shiftKey){ event.preventDefault(); this.form.requestSubmit(); }"></textarea>' +
-                        '<button type="submit" class="px-4 py-2 rounded-lg bg-brand-accent text-white font-bold self-end">Gönder</button></form></div></div>';
+                        '<div class="border-t border-gray-800 p-3"><form onsubmit="if(app._supabaseOffline){ showToast(\'Sunucu bağlantısı yok.\'); return false; } (async function(){ var ta=document.getElementById(\'messageComposer\'); var t=ta&&ta.value?ta.value.trim():\'\'; if(t){ await Messaging.sendMessage(' + selectedId + ', app.currentUser.id, t); ta.value=\'\'; app.router(\'messages\', { threadId: ' + selectedId + ' }); app.updateNav(); } })(); return false;" class="flex gap-2">' +
+                        '<textarea id="messageComposer" rows="2" class="flex-1 bg-gray-800 border border-gray-700 rounded-lg p-2 text-white placeholder-gray-500 resize-none" placeholder="Mesaj yazın (Enter gönder, Shift+Enter yeni satır)" onkeydown="if(event.key===\'Enter\'&&!event.shiftKey){ event.preventDefault(); this.form.requestSubmit(); }" ' + (app._supabaseOffline ? 'disabled' : '') + '></textarea>' +
+                        '<button type="submit" class="px-4 py-2 rounded-lg bg-brand-accent text-white font-bold self-end ' + (app._supabaseOffline ? 'opacity-50 cursor-not-allowed' : '') + '" ' + (app._supabaseOffline ? 'disabled title="Sunucu bağlantısı yok"' : '') + '>Gönder</button></form></div></div>';
                 } else {
                     chatHtml = '<div class="flex-1 flex items-center justify-center text-gray-500"><p>Bir sohbet seçin veya profil/ilandan "Mesaj" ile yeni başlatın.</p></div>';
                 }
@@ -2374,6 +2539,12 @@
                             <button onclick="SettingsAPI.exportData()" class="w-full border border-gray-700 text-gray-300 py-2 rounded text-sm hover:bg-white/5 mb-2">Verilerimi dışa aktar</button>
                             <button onclick="if(confirm(\'Tüm verileriniz silinecek. Emin misiniz?\')) SettingsAPI.deleteAccount();" class="w-full border border-red-800 text-red-400 py-2 rounded text-sm hover:bg-red-500/10">Hesabı sil</button>
                         </div>
+                        ${USE_SUPABASE && supabase ? `<div class="rounded-xl border border-gray-700 bg-gray-900/40 p-4 mb-6">
+                            <div class="text-xs font-bold text-gray-400 uppercase mb-2">Supabase RLS Self Test</div>
+                            <p class="text-sm text-gray-400 mb-2">listings / messages / applications select ve yetkisiz erişim kontrolü.</p>
+                            <button type="button" onclick="RLSAPI.runSelfTestUI()" class="w-full border border-amber-700 text-amber-300 py-2 rounded text-sm hover:bg-amber-500/10 mb-2">RLS SELF TEST çalıştır</button>
+                            <div id="rlsTestResult" class="min-h-[2rem] text-sm text-gray-400"></div>
+                        </div>` : ''}
                     </div>
                 </div>`;
             },
@@ -2569,18 +2740,36 @@
 
         // --- FORM / API HANDLERS ---
         const RegisterAPI = {
-            submit: () => {
+            submit: async () => {
                 const role = window._registerRole;
                 if (!role) { alert('Lütfen üyelik türünü seçin: DJ, Mekan veya Organizatör.'); return; }
                 const name = document.getElementById('regName').value.trim();
                 const email = document.getElementById('regEmail').value.trim();
                 const pass = document.getElementById('regPass').value;
-                const location = document.getElementById('regLocation').value.trim();
+                const city = (document.getElementById('regLocation') && document.getElementById('regLocation').value) ? document.getElementById('regLocation').value.trim() : '';
                 if (!name || !email || !pass) { alert('Ad, email ve şifre zorunludur.'); return; }
+                if (USE_SUPABASE && supabase) {
+                    const { data, error } = await supabase.auth.signUp({ email, password: pass });
+                    if (error) { showSupabaseError(error, 'signUp'); alert(error.message || 'Kayıt başarısız.'); return; }
+                    const uid = data.user.id;
+                    await supabase.from('profiles').insert({ user_id: uid, role, display_name: name, city });
+                    if (role === 'dj') await supabase.from('dj_profiles').insert({ user_id: uid, genres: [], bpm_min: 120, bpm_max: 130, nightly_fee: 0, bio: '', tech_rider: '', equipment_provided: [], soundcloud_embed: '', spotify_embed: '', mixcloud_embed: '', min_notice_days: null, travel_radius_km: null });
+                    if (role === 'venue') await supabase.from('venue_profiles').insert({ user_id: uid, venue_name: name, city, capacity: '', typical_genres: [], budget_range: '', equipment: [], ticket_price_policy: '', ticket_cut_percent: null, ticket_cut_amount: null, percentage_policies: '' });
+                    if (role === 'organizer') await supabase.from('organizer_profiles').insert({ user_id: uid, organizer_name: name, city, network_tags: [], organization_fee: null, organization_fee_percent: null, requirements: [], contact_phone: '' });
+                    if (role === 'decorator') await supabase.from('decorator_profiles').insert({ user_id: uid, business_name: name, city, service_area_km: null, categories: [], portfolio_drive_links: [] });
+                    await supabase.from('common_profiles').insert({ user_id: uid, display_name: name, bio: '', languages: [], tags: [], working_cities: [], show_email: false, show_phone: false, allow_direct_booking: true, preferred_contact_method: 'in_app', last_updated: Date.now() });
+                    const user = { id: uid, email, type: role, name };
+                    Store.setCurrentUser(user);
+                    app.currentUser = user;
+                    app.updateNav();
+                    await SupabaseDataService.loadProfilesAndUsers();
+                    app.router('onboarding');
+                    return;
+                }
                 const users = Store.get('users');
                 if (users.some(u => u.email === email)) { alert('Bu email zaten kayıtlı.'); return; }
                 const id = nextId('users');
-                const user = { id, type: role, name, email, password: pass, location, createdAt: Date.now(), status: 'active', xp: 0, level: 1, badges: [] };
+                const user = { id, type: role, name, email, password: pass, location: city, createdAt: Date.now(), status: 'active', xp: 0, level: 1, badges: [] };
                 users.push(user);
                 Store.set('users', users);
                 var socialEmpty = { instagram: '', tiktok: '', x: '', facebook: '', whatsapp: '', telegram: '', soundcloud: '', bandcamp: '' };
@@ -2598,7 +2787,49 @@
             }
         };
 
-        document.addEventListener('DOMContentLoaded', () => {
+        document.addEventListener('DOMContentLoaded', async () => {
+            // --- Runtime config yükle (key'ler /api/public-config'den gelir) ---
+            await __loadRuntimeConfig();
+
+            if (USE_SUPABASE && SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.length > 50) {
+                try {
+                    const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
+                    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+                    await SupabaseDataService.loadAll();
+                    const { data: { session } } = await supabase.auth.getSession();
+                    if (session && session.user) {
+                        const { data: prof } = await supabase.from('profiles').select('*').eq('user_id', session.user.id).single();
+                        __cache.currentUser = prof ? { id: session.user.id, email: session.user.email, type: prof.role, name: prof.display_name || session.user.email } : { id: session.user.id, email: session.user.email, type: 'dj', name: session.user.email };
+                    }
+                    supabase.auth.onAuthStateChange(async (ev, s) => {
+                        if (!s || !s.user) { __cache.currentUser = null; app.updateNav(); app.router('home'); return; }
+                        const { data: prof } = await supabase.from('profiles').select('*').eq('user_id', s.user.id).single();
+                        __cache.currentUser = prof ? { id: s.user.id, email: s.user.email, type: prof.role, name: prof.display_name || s.user.email } : { id: s.user.id, email: s.user.email, type: 'dj', name: s.user.email };
+                        app.currentUser = __cache.currentUser;
+                        app.updateNav();
+                        await SupabaseDataService.loadMessages();
+                    });
+                    app._realtime = app._realtime || {};
+                    if (!app._realtime.listings) {
+                        const chList = supabase.channel('listings-rt');
+                        chList.on('postgres_changes', { event: '*', schema: 'public', table: 'listings' }, async () => { await SupabaseDataService.loadListings(); if (app._currentView === 'listings') app.router('listings'); });
+                        /* event -> loadListings (cache refresh) -> sonra UI router */
+                        chList.subscribe();
+                        app._realtime.listings = chList;
+                    }
+                    if (!app._realtime.messages) {
+                        const chMsg = supabase.channel('messages-rt');
+                        chMsg.on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, async () => { if (app.currentUser) await SupabaseDataService.loadMessages(); if (app._currentView === 'messages') app.router('messages', app._routeParams); });
+                        /* event -> loadMessages (cache refresh) -> sonra UI router */
+                        chMsg.subscribe();
+                        app._realtime.messages = chMsg;
+                    }
+                } catch (e) {
+                    console.error('Supabase bootstrap failed:', e);
+                    showSupabaseError(e, 'bootstrap');
+                    if (ALLOW_LOCAL_FALLBACK) { USE_SUPABASE = false; supabase = null; } else { app._supabaseOffline = true; supabase = null; var ob = document.getElementById('offlineBanner'); if (ob) ob.classList.remove('hidden'); }
+                }
+            }
             app.init();
             // CoreMind Background v1: parallax (mouse) + Strategy B watermark
             if (typeof COREMIND_LOGO_URL === 'string' && COREMIND_LOGO_URL.length > 0) {
@@ -2627,6 +2858,20 @@
                     e.preventDefault();
                     const email = document.getElementById('loginEmail').value.trim();
                     const pass = document.getElementById('loginPass').value;
+                    if (USE_SUPABASE && supabase) {
+                        (async () => {
+                            const { data, error } = await supabase.auth.signInWithPassword({ email, password: pass });
+                            if (error) { showSupabaseError(error, 'signIn'); return; }
+                            const { data: prof } = await supabase.from('profiles').select('*').eq('user_id', data.user.id).single();
+                            const user = prof ? { id: data.user.id, email: data.user.email, type: prof.role, name: prof.display_name || data.user.email } : { id: data.user.id, email: data.user.email, type: 'dj', name: data.user.email };
+                            Store.setCurrentUser(user);
+                            app.currentUser = user;
+                            app.updateNav();
+                            if (!hasCompletedOnboarding(user)) app.router('onboarding');
+                            else app.router('dashboard');
+                        })();
+                        return;
+                    }
                     const user = Store.get('users').find(u => u.email === email && u.password === pass);
                     if (!user) { alert('Email veya şifre hatalı.'); return; }
                     Store.setCurrentUser(user);
@@ -2715,6 +2960,7 @@
                 }
                 if (form.id === 'listingForm') {
                     e.preventDefault();
+                    if (app._supabaseOffline) { showToast('Sunucu bağlantısı yok.'); return; }
                     const rawType = document.getElementById('listingType').value;
                     if (rawType === 'decorRental' || rawType === LISTING_TYPE.DECOR_RENTAL) {
                         const title = document.getElementById('listingTitle').value.trim();
@@ -2727,12 +2973,13 @@
                         const errs = validateDecorListing(payload);
                         if (errs.length) { alert(errs.join('\n')); return; }
                         const listing = {
-                            id: nextId('listings'),
                             createdByUserId: app.currentUser.id,
                             listingType: LISTING_TYPE.DECOR_RENTAL,
                             ownerRole: 'decorator',
                             title,
                             city,
+                            visibility: 'public',
+                            status: 'active',
                             pricingModel,
                             price: priceVal,
                             currency: 'TRY',
@@ -2740,22 +2987,24 @@
                             deposit: (document.getElementById('listingDeposit') && document.getElementById('listingDeposit').value) ? parseFloat(document.getElementById('listingDeposit').value) : null,
                             setupFee: (document.getElementById('listingSetupFee') && document.getElementById('listingSetupFee').value) ? parseFloat(document.getElementById('listingSetupFee').value) : null,
                             deliveryIncluded: !!(document.getElementById('listingDeliveryIncluded') && document.getElementById('listingDeliveryIncluded').checked),
-                            notes: (document.getElementById('listingNotes') && document.getElementById('listingNotes').value) ? document.getElementById('listingNotes').value.trim() : null,
-                            visibility: 'public',
-                            status: 'active',
-                            createdAt: Date.now()
+                            notes: (document.getElementById('listingNotes') && document.getElementById('listingNotes').value) ? document.getElementById('listingNotes').value.trim() : null
                         };
-                        const list = Store.get('listings');
-                        list.push(listing);
-                        Store.set('listings', list);
+                        if (USE_SUPABASE && supabase) {
+                            (async () => { const row = SupabaseDataService.listingToRow(listing); const { error } = await supabase.from('listings').insert(row); if (error) { showSupabaseError(error, 'listing insert'); return; } await SupabaseDataService.loadListings(); app.router('listings'); })();
+                            return;
+                        }
+                        listing.id = nextId('listings'); listing.createdAt = Date.now();
+                        const list = Store.get('listings'); list.push(listing); Store.set('listings', list);
                         app.router('listings');
                         return;
                     }
                     const genres = [...form.querySelectorAll('input[name="listingGenre"]:checked')].map(c => c.value);
+                    const lt = document.getElementById('listingType').value;
+                    const ownerRole = (lt === 'VENUE_NEEDS' || lt === 'venueNeeds') ? 'venue' : (lt === 'ORGANIZER_EVENT' || lt === 'organizerEvent') ? 'organizer' : 'dj';
                     const listing = {
-                        id: nextId('listings'),
                         createdByUserId: app.currentUser.id,
-                        listingType: document.getElementById('listingType').value,
+                        ownerRole,
+                        listingType: lt,
                         title: document.getElementById('listingTitle').value.trim(),
                         genres,
                         bpmTargetMin: clampBPM(document.getElementById('listingBpmMin').value) || null,
@@ -2789,6 +3038,11 @@
                     el = document.getElementById('listingCancelPolicy'); if (el && el.value) listing.cancelPolicy = el.value;
                     var atc = form.querySelectorAll('input[name="listingAcceptedTicket"]:checked'); listing.acceptedTicketModels = atc.length ? [...atc].map(c => c.value) : [];
                     el = document.getElementById('listingEquipmentRequested'); if (el && el.value) listing.equipmentRequested = el.value.trim();
+                    if (USE_SUPABASE && supabase) {
+                        (async () => { const row = SupabaseDataService.listingToRow(listing); const { error } = await supabase.from('listings').insert(row); if (error) { showSupabaseError(error, 'listing insert'); return; } await SupabaseDataService.loadListings(); app.router('listings'); })();
+                        return;
+                    }
+                    listing.id = nextId('listings');
                     const list = Store.get('listings');
                     list.push(listing);
                     Store.set('listings', list);
@@ -3049,28 +3303,39 @@
             }
         };
         const DealRoomAPI = {
-            getOrCreate: (listingId, applicantUserId) => {
-                const rooms = Store.get('dealRooms');
-                let room = rooms.find(r => r.listingId === listingId && r.applicantUserId === applicantUserId);
+            getOrCreate: async (listingId, applicantUserId) => {
+                const lid = Number(listingId);
+                const aid = String(applicantUserId);
+                let room = Store.get('dealRooms').find(r => (r.listingId === lid || r.listingId == lid) && String(r.applicantUserId) === aid);
                 if (room) return room;
-                const listing = Store.get('listings').find(l => l.id === listingId);
+                if (USE_SUPABASE && supabase) {
+                    const listing = Store.get('listings').find(l => l.id === lid || l.id == lid);
+                    const ownerId = listing ? listing.createdByUserId : null;
+                    if (!ownerId) return null;
+                    await supabase.from('applications').upsert({ listing_id: lid, applicant_id: aid, status: 'pending' }, { onConflict: 'listing_id,applicant_id' });
+                    const { data: existing } = await supabase.from('deal_rooms').select('*').eq('listing_id', lid).eq('applicant_id', aid).single();
+                    if (existing) { await SupabaseDataService.loadAll(); return Store.get('dealRooms').find(r => (r.listingId === lid || r.listingId == lid) && String(r.applicantUserId) === aid); }
+                    const { data: ins } = await supabase.from('deal_rooms').insert({ listing_id: lid, applicant_id: aid, owner_id: ownerId, status: 'initiated', offer_terms: {} }).select('*').single();
+                    await SupabaseDataService.loadAll();
+                    return Store.get('dealRooms').find(r => r.id === (ins && ins.id));
+                }
+                const listing = Store.get('listings').find(l => l.id === lid);
                 const listingOwnerUserId = listing ? listing.createdByUserId : null;
-                room = { id: nextId('dealRooms'), listingId, applicantUserId, listingOwnerUserId, status: 'initiated', offerTerms: {}, evidenceLinks: [], createdAt: Date.now(), updatedAt: Date.now() };
-                rooms.push(room);
-                Store.set('dealRooms', rooms);
-                const appList = Store.get('applications');
-                appList.push({ id: nextId('applications'), listingId, userId: applicantUserId, createdAt: Date.now(), status: 'pending' });
-                Store.set('applications', appList);
+                room = { id: nextId('dealRooms'), listingId: lid, applicantUserId: aid, listingOwnerUserId, status: 'initiated', offerTerms: {}, evidenceLinks: [], createdAt: Date.now(), updatedAt: Date.now() };
+                const rooms = Store.get('dealRooms'); rooms.push(room); Store.set('dealRooms', rooms);
+                const appList = Store.get('applications'); appList.push({ id: nextId('applications'), listingId: lid, userId: aid, createdAt: Date.now(), status: 'pending' }); Store.set('applications', appList);
                 return room;
             },
-            get: (listingId, applicantUserId) => Store.get('dealRooms').find(r => r.listingId === listingId && r.applicantUserId === applicantUserId),
-            sendMessage: (roomId, text) => {
+            get: (listingId, applicantUserId) => Store.get('dealRooms').find(r => (r.listingId === Number(listingId) || r.listingId == listingId) && String(r.applicantUserId) === String(applicantUserId)),
+            sendMessage: async (roomId, text) => {
                 if (!text || !app.currentUser) return;
+                if (USE_SUPABASE && supabase) { await supabase.from('deal_room_messages').insert({ deal_room_id: roomId, user_id: app.currentUser.id, text: String(text).trim() }); const { data: dm } = await supabase.from('deal_room_messages').select('*'); setCache('dealRoomMessages', (dm || []).map(m => ({ id: m.id, dealRoomId: m.deal_room_id, userId: m.user_id, text: m.text, createdAt: m.created_at ? new Date(m.created_at).getTime() : 0 }))); return; }
                 const list = Store.get('dealRoomMessages');
                 list.push({ id: nextId('dealRoomMessages'), dealRoomId: roomId, userId: app.currentUser.id, text: String(text).trim(), createdAt: Date.now() });
                 Store.set('dealRoomMessages', list);
             },
-            updateOffer: (roomId, terms) => {
+            updateOffer: async (roomId, terms) => {
+                if (USE_SUPABASE && supabase) { await supabase.from('deal_rooms').update({ offer_terms: terms, status: 'negotiating', updated_at: new Date().toISOString() }).eq('id', roomId); await SupabaseDataService.loadAll(); return; }
                 const rooms = Store.get('dealRooms');
                 const i = rooms.findIndex(r => r.id === roomId);
                 if (i < 0) return;
@@ -3079,7 +3344,16 @@
                 rooms[i].updatedAt = Date.now();
                 Store.set('dealRooms', rooms);
             },
-            updateStatus: (roomId, status) => {
+            updateStatus: async (roomId, status) => {
+                if (USE_SUPABASE && supabase) {
+                    const rooms = Store.get('dealRooms');
+                    const room = rooms.find(r => r.id === roomId);
+                    let snapshot = null;
+                    if (status === 'accepted' && room) { const listing = Store.get('listings').find(l => l.id === room.listingId); const owner = Store.get('users').find(u => String(u.id) === String(room.listingOwnerUserId)); const applicant = Store.get('users').find(u => String(u.id) === String(room.applicantUserId)); snapshot = getEffectiveTerms(room, listing, owner, applicant); }
+                    await supabase.from('deal_rooms').update({ status, accepted_terms_snapshot: snapshot, updated_at: new Date().toISOString() }).eq('id', roomId);
+                    await SupabaseDataService.loadAll();
+                    return;
+                }
                 const rooms = Store.get('dealRooms');
                 const i = rooms.findIndex(r => r.id === roomId);
                 if (i < 0) return;
@@ -3109,7 +3383,8 @@
             return terms;
         }
         const LedgerAPI = {
-            add: (dealRoomId, amount, payerUserId, payeeUserId, status) => {
+            add: async (dealRoomId, amount, payerUserId, payeeUserId, status) => {
+                if (USE_SUPABASE && supabase) { await supabase.from('ledger').insert({ deal_room_id: dealRoomId, amount, currency: 'TRY', payer_user_id: payerUserId, payee_user_id: payeeUserId, status: status || 'held', release_condition: 'event_completed' }); const { data } = await supabase.from('ledger').select('*'); setCache('ledger', (data || []).map(e => ({ id: e.id, dealRoomId: e.deal_room_id, amount: e.amount, payerUserId: e.payer_user_id, payeeUserId: e.payee_user_id, status: e.status, createdAt: e.created_at ? new Date(e.created_at).getTime() : 0 }))); return; }
                 const list = Store.get('ledger');
                 list.push({ id: nextId('ledger'), dealRoomId, amount, currency: 'TRY', payerUserId, payeeUserId, status: status || 'held', releaseCondition: 'event_completed', createdAt: Date.now() });
                 Store.set('ledger', list);
@@ -3117,29 +3392,58 @@
             getByRoom: (dealRoomId) => Store.get('ledger').filter(e => e.dealRoomId === dealRoomId)
         };
         const ApplicationsAPI = {
-            apply: (listingId) => {
+            apply: async (listingId) => {
                 if (!app.currentUser) { alert('Başvuru için giriş yapın.'); return; }
                 const applicantUserId = app.currentUser.id;
-                DealRoomAPI.getOrCreate(listingId, applicantUserId);
+                await DealRoomAPI.getOrCreate(listingId, applicantUserId);
                 app.router('deal-room', { listingId: Number(listingId), applicantUserId });
             }
         };
-        /* Mesajlaşma: sadece uygulama içi DM. threads + messages + blocklist. QA: tüm roller birbirine mesaj atabilir, unread badge, kalıcılık, engelleme. */
-        // Mesajlaşma QA: Tüm roller arası DM; unread badge thread açılınca sıfırlanır; mesajlar localStorage'da kalıcı; engellenen kullanıcı sendMessage ile engellenir; UI'de e-posta/telefon gösterilmez.
+        /* Mesajlaşma: sadece uygulama içi DM. threads + messages + blocklist. Supabase: message_threads, thread_participants, messages. */
         const Messaging = {
-            getOrCreateThread: (userIdA, userIdB, context) => {
-                var a = Math.min(userIdA, userIdB), b = Math.max(userIdA, userIdB);
+            getOrCreateThread: async (userIdA, userIdB, context) => {
+                const a = String(userIdA), b = String(userIdB);
+                const sortPair = [a, b].sort();
+                if (USE_SUPABASE && supabase) {
+                    const { data: existing } = await supabase.from('thread_participants').select('thread_id').eq('user_id', a);
+                    const idsA = (existing || []).map(x => x.thread_id);
+                    if (idsA.length) {
+                        const { data: match } = await supabase.from('thread_participants').select('thread_id').eq('user_id', b).in('thread_id', idsA);
+                        if (match && match.length) { await SupabaseDataService.loadMessages(); return match[0].thread_id; }
+                    }
+                    const { data: ins, error } = await supabase.from('message_threads').insert({ context: context || {} }).select('id').single();
+                    if (error) { console.error(error); return null; }
+                    const tid = ins.id;
+                    await supabase.from('thread_participants').insert([{ thread_id: tid, user_id: a }, { thread_id: tid, user_id: b }]);
+                    await SupabaseDataService.loadMessages();
+                    return tid;
+                }
                 var threads = Store.get('messageThreads') || [];
-                var t = threads.find(function(x) { var p = x.participantIds; return p && p.length === 2 && ((p[0] === a && p[1] === b) || (p[0] === b && p[1] === a)); });
+                var t = threads.find(function(x) { var p = x.participantIds || []; return p.length === 2 && ((p[0] === a && p[1] === b) || (p[0] === b && p[1] === a)); });
                 if (t) return t.id;
                 var id = nextId('messageThreads');
-                threads.push({ id: id, participantIds: [a, b], createdAt: Date.now(), lastMessageAt: 0, lastMessageText: '', context: context || {}, unreadBy: {} });
+                threads.push({ id: id, participantIds: sortPair, createdAt: Date.now(), lastMessageAt: 0, lastMessageText: '', context: context || {}, unreadBy: {} });
                 Store.set('messageThreads', threads);
                 return id;
             },
-            sendMessage: (threadId, senderId, text) => {
+            _lastMessageSentAt: 0,
+            sendMessage: async (threadId, senderId, text) => {
                 text = (text || '').trim();
                 if (!text || !app.currentUser || app.currentUser.id !== senderId) return false;
+                if (USE_SUPABASE && supabase) {
+                    if (Date.now() - (Messaging._lastMessageSentAt || 0) < 1000) { if (typeof showToast === 'function') showToast('Lütfen 1 saniye bekleyin.'); return false; }
+                    var thread = (Store.get('messageThreads') || []).find(function(x) { return x.id === threadId || String(x.id) === String(threadId); });
+                    if (!thread) return false;
+                    var otherId = (thread.participantIds || [])[0] === String(senderId) ? (thread.participantIds || [])[1] : (thread.participantIds || [])[0];
+                    Messaging._lastMessageSentAt = Date.now();
+                    const { error: insErr } = await supabase.from('messages').insert({ thread_id: threadId, sender_id: senderId, text });
+                    if (insErr) { console.error(insErr); return false; }
+                    await supabase.from('message_threads').update({ last_message_at: new Date().toISOString(), last_message_text: text.length > 60 ? text.slice(0, 60) + '…' : text }).eq('id', threadId);
+                    const { data: tp } = await supabase.from('thread_participants').select('unread_count').eq('thread_id', threadId).eq('user_id', otherId).single();
+                    await supabase.from('thread_participants').update({ unread_count: (tp && tp.unread_count || 0) + 1 }).eq('thread_id', threadId).eq('user_id', otherId);
+                    await SupabaseDataService.loadMessages();
+                    return true;
+                }
                 var blocklist = Store.get('messagingBlocklist') || [];
                 var thread = (Store.get('messageThreads') || []).find(function(x) { return x.id === threadId; });
                 if (!thread) return false;
@@ -3161,21 +3465,25 @@
                 return true;
             },
             getThreadsForUser: (userId) => {
-                var threads = (Store.get('messageThreads') || []).filter(function(t) { return t.participantIds && t.participantIds.indexOf(userId) >= 0; });
-                return threads.sort(function(a, b) { return (b.lastMessageAt || b.createdAt) - (a.lastMessageAt || a.createdAt); });
+                const uid = String(userId);
+                var threads = (Store.get('messageThreads') || []).filter(function(t) { var p = t.participantIds || []; return p.some(function(x) { return String(x) === uid; }); });
+                return threads.sort(function(a, b) { return (b.lastMessageAt || b.createdAt || 0) - (a.lastMessageAt || a.createdAt || 0); });
             },
             getMessages: (threadId) => {
-                return (Store.get('messages') || []).filter(function(m) { return m.threadId === threadId; }).sort(function(a, b) { return a.createdAt - b.createdAt; });
+                const tid = String(threadId);
+                return (Store.get('messages') || []).filter(function(m) { return String(m.threadId) === tid; }).sort(function(a, b) { return a.createdAt - b.createdAt; });
             },
-            markThreadRead: (threadId, userId) => {
+            markThreadRead: async (threadId, userId) => {
+                if (USE_SUPABASE && supabase) { await supabase.from('thread_participants').update({ unread_count: 0 }).eq('thread_id', threadId).eq('user_id', userId); await SupabaseDataService.loadMessages(); return; }
                 var threads = Store.get('messageThreads') || [];
-                var i = threads.findIndex(function(x) { return x.id === threadId; });
+                var i = threads.findIndex(function(x) { return x.id === threadId || String(x.id) === String(threadId); });
                 if (i >= 0 && threads[i].unreadBy) { threads[i].unreadBy[userId] = 0; Store.set('messageThreads', threads); }
             },
             getUnreadTotal: (userId) => {
+                const uid = String(userId);
                 var threads = Store.get('messageThreads') || [];
                 var n = 0;
-                threads.forEach(function(t) { if (t.participantIds && t.participantIds.indexOf(userId) >= 0) n += (t.unreadBy && t.unreadBy[userId]) ? t.unreadBy[userId] : 0; });
+                threads.forEach(function(t) { if ((t.participantIds || []).some(function(x) { return String(x) === uid; })) n += (t.unreadBy && t.unreadBy[uid]) ? t.unreadBy[uid] : 0; });
                 return n;
             },
             blockUser: (blockerId, blockedId) => {
@@ -3187,10 +3495,11 @@
                 reports.push({ threadId: threadId, reason: reason || 'spam', createdAt: Date.now() });
                 Store.set('messageThreadReports', reports);
             },
-            openThreadWith: (targetUserId, context) => {
+            openThreadWith: async (targetUserId, context) => {
                 if (!app.currentUser) return;
-                var tid = Messaging.getOrCreateThread(app.currentUser.id, targetUserId, context || {});
+                var tid = await Messaging.getOrCreateThread(app.currentUser.id, targetUserId, context || {});
                 Messaging._lastThreadId = tid;
+                return tid;
             }
         };
         function showToast(message) {
@@ -3363,6 +3672,45 @@
                 list[i].soundcloud = social.soundcloud || '';
                 list[i].bandcamp = social.bandcamp || '';
                 Store.set(key, list);
+            }
+        };
+
+        // --- RLS SELF TEST (Supabase yetki kontrolü, Ayarlar sayfasından çalıştırılır) ---
+        const RLSAPI = {
+            runSelfTest: async () => {
+                if (!supabase || !USE_SUPABASE) return [{ name: 'Supabase kapalı', ok: false, error: 'USE_SUPABASE false veya supabase null' }];
+                const results = [];
+                try {
+                    const { error: e1 } = await supabase.from('listings').select('id').limit(1);
+                    results.push({ name: 'listings select (kendi verim)', ok: !e1, error: e1 ? e1.message : null });
+                } catch (e) { results.push({ name: 'listings select', ok: false, error: (e && e.message) || String(e) }); }
+                try {
+                    const { error: e2 } = await supabase.from('messages').select('id').limit(1);
+                    results.push({ name: 'messages select (erişebildiğim)', ok: !e2, error: e2 ? e2.message : null });
+                } catch (e) { results.push({ name: 'messages select', ok: false, error: (e && e.message) || String(e) }); }
+                try {
+                    const { error: e3 } = await supabase.from('applications').select('id').limit(1);
+                    results.push({ name: 'applications select', ok: !e3, error: e3 ? e3.message : null });
+                } catch (e) { results.push({ name: 'applications select', ok: false, error: (e && e.message) || String(e) }); }
+                try {
+                    const UNAUTH_THREAD_ID = 999999999;
+                    const { data: msgData, error: e4 } = await supabase.from('messages').select('id').eq('thread_id', UNAUTH_THREAD_ID).limit(1);
+                    const unauthorizedOk = e4 !== null || (msgData && msgData.length === 0);
+                    results.push({ name: 'RLS: yetkisiz thread mesajı (reddedilmeli)', ok: unauthorizedOk, error: unauthorizedOk ? (e4 ? e4.message : '0 row (expected)') : (msgData && msgData.length ? 'Yetkisiz veri döndü' : null) });
+                } catch (e) { results.push({ name: 'RLS yetkisiz messages', ok: false, error: (e && e.message) || String(e) }); }
+                try {
+                    const UNAUTH_ROOM_ID = 999999999;
+                    const { data: drmData, error: e5 } = await supabase.from('deal_room_messages').select('id').eq('deal_room_id', UNAUTH_ROOM_ID).limit(1);
+                    const unauthorizedRoomOk = e5 !== null || (drmData && drmData.length === 0);
+                    results.push({ name: 'RLS: yetkisiz deal_room (reddedilmeli)', ok: unauthorizedRoomOk, error: unauthorizedRoomOk ? (e5 ? e5.message : '0 row (expected)') : (drmData && drmData.length ? 'Yetkisiz veri döndü' : null) });
+                } catch (e) { results.push({ name: 'RLS yetkisiz deal_room', ok: false, error: (e && e.message) || String(e) }); }
+                return results;
+            },
+            runSelfTestUI: async () => {
+                var el = document.getElementById('rlsTestResult');
+                if (el) el.innerHTML = 'Çalışıyor...';
+                var r = await RLSAPI.runSelfTest();
+                if (el) el.innerHTML = '<ul class="text-xs mt-2 space-y-1">' + r.map(function(x) { return '<li class="' + (x.ok ? 'text-green-400' : 'text-red-400') + '">' + escapeHtml(x.name) + ': ' + (x.ok ? 'OK' : (x.error || 'fail')) + '</li>'; }).join('') + '</ul>';
             }
         };
 
