@@ -212,7 +212,7 @@
     </div>
 
     <!-- MAIN APP: anasayfa doğrudan gösterilir, JS ile güncellenir -->
-    <main id="app" class="flex-1 flex flex-col overflow-hidden min-h-0 min-h-[50vh]">
+    <main id="appRoot" class="flex-1 flex flex-col overflow-hidden min-h-0 min-h-[50vh]">
         <div class="h-full flex items-center justify-center bg-gradient-to-b from-[#0a0a0b] via-[#1a0a1a] to-[#0a0a0b] bg-cover bg-center p-4 sm:p-6">
             <div class="glass-panel p-6 sm:p-8 rounded-2xl w-full max-w-md backdrop-blur-xl text-center border border-gray-800">
                 <h2 class="text-3xl font-display font-bold mb-1 text-white">CoreMind</h2>
@@ -256,6 +256,11 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <!-- JS ENGINE -->
     <script>
+        // ── GLOBAL SAFETY: app'i erken tanımla (TDZ/inline onclick koruması) ──
+        // Asıl app objesi aşağıda "APP CONTROLLER" bölümünde üzerine yazılır.
+        // Bu satır sadece script yüklenirken erken referansların patlamasını engeller.
+        var app = window.app = window.app || {};
+
         // Asset Strategy B: tek dosya dağıtım için base64 logo (boş bırakılırsa ./assets/coremind-logo.webp kullanılır)
         const COREMIND_LOGO_URL = '';
 
@@ -1106,7 +1111,9 @@
         function clampBPM(v) { return Math.min(220, Math.max(60, parseInt(v, 10) || 0)); }
 
         // --- APP CONTROLLER ---
-        const app = {
+        // var kullanılıyor: TDZ (Temporal Dead Zone) yok, inline onclick global erişim garanti.
+        // id="appRoot" olarak değiştirildi, DOM çakışması kaldırıldı.
+        var app = window.app = {
             currentUser: null,
             _supabaseOffline: false,
             init: () => {
@@ -1121,7 +1128,7 @@
                     }
                 } catch (err) {
                     console.error('App init error:', err);
-                    var main = document.getElementById('app');
+                    var main = document.getElementById('appRoot');
                     if (main && typeof Views !== 'undefined' && Views.home) main.innerHTML = Views.home();
                     try { app.updateNav(); } catch (_) {}
                 }
@@ -1201,7 +1208,7 @@
                     if (modal) { modal.classList.remove('hidden'); modal.classList.add('flex'); }
                     return;
                 }
-                const main = document.getElementById('app');
+                const main = document.getElementById('appRoot');
                 if (!main) return;
                 main.innerHTML = '';
                 const needAuth = ['dashboard','logo-studio','set-upload','listing-create','match','connections','reviews','moderation','settings','onboarding','listings','calendar','deal-room','deal-rooms','profile-edit','messages'];
@@ -2788,11 +2795,20 @@
         };
 
         document.addEventListener('DOMContentLoaded', async () => {
-            // --- Runtime config yükle (key'ler /api/public-config'den gelir) ---
-            await __loadRuntimeConfig();
+            // ═══════════════════════════════════════════════════════════
+            // 1) UI ÖNCE HAZIR OLSUN — Supabase'den bağımsız çalışır.
+            //    Butonlar, nav, router hemen aktif.
+            // ═══════════════════════════════════════════════════════════
+            app.init();
 
-            if (USE_SUPABASE && SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.length > 50) {
-                try {
+            // ═══════════════════════════════════════════════════════════
+            // 2) SUPABASE BOOTSTRAP — hata olursa UI çalışmaya devam eder.
+            // ═══════════════════════════════════════════════════════════
+            try {
+                // Runtime config yükle (key'ler /api/public-config'den gelir)
+                await __loadRuntimeConfig();
+
+                if (USE_SUPABASE && SUPABASE_URL && SUPABASE_ANON_KEY && SUPABASE_ANON_KEY.length > 50) {
                     const { createClient } = await import('https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm');
                     supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
                     await SupabaseDataService.loadAll();
@@ -2813,24 +2829,29 @@
                     if (!app._realtime.listings) {
                         const chList = supabase.channel('listings-rt');
                         chList.on('postgres_changes', { event: '*', schema: 'public', table: 'listings' }, async () => { await SupabaseDataService.loadListings(); if (app._currentView === 'listings') app.router('listings'); });
-                        /* event -> loadListings (cache refresh) -> sonra UI router */
                         chList.subscribe();
                         app._realtime.listings = chList;
                     }
                     if (!app._realtime.messages) {
                         const chMsg = supabase.channel('messages-rt');
                         chMsg.on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, async () => { if (app.currentUser) await SupabaseDataService.loadMessages(); if (app._currentView === 'messages') app.router('messages', app._routeParams); });
-                        /* event -> loadMessages (cache refresh) -> sonra UI router */
                         chMsg.subscribe();
                         app._realtime.messages = chMsg;
                     }
-                } catch (e) {
-                    console.error('Supabase bootstrap failed:', e);
-                    showSupabaseError(e, 'bootstrap');
-                    if (ALLOW_LOCAL_FALLBACK) { USE_SUPABASE = false; supabase = null; } else { app._supabaseOffline = true; supabase = null; var ob = document.getElementById('offlineBanner'); if (ob) ob.classList.remove('hidden'); }
+                    // Supabase başarılı — UI'ı güncelle (session varsa dashboard'a geç)
+                    app.currentUser = Store.getCurrentUser ? Store.getCurrentUser() : null;
+                    app.updateNav();
+                    if (app.currentUser) {
+                        if (typeof hasCompletedOnboarding === 'function' && !hasCompletedOnboarding(app.currentUser)) app.router('onboarding');
+                        else app.router('dashboard');
+                    }
                 }
+            } catch (e) {
+                console.error('[BOOTSTRAP FAIL]', e);
+                if (typeof showSupabaseError === 'function') showSupabaseError(e, 'bootstrap');
+                if (ALLOW_LOCAL_FALLBACK) { USE_SUPABASE = false; supabase = null; }
+                else { app._supabaseOffline = true; supabase = null; var ob = document.getElementById('offlineBanner'); if (ob) ob.classList.remove('hidden'); }
             }
-            app.init();
             // CoreMind Background v1: parallax (mouse) + Strategy B watermark
             if (typeof COREMIND_LOGO_URL === 'string' && COREMIND_LOGO_URL.length > 0) {
                 document.documentElement.style.setProperty('--coremind-watermark-url', 'url(' + COREMIND_LOGO_URL + ')');
